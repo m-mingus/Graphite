@@ -91,6 +91,8 @@ pub enum PathToolMessage {
 	NudgeSelectedPoints {
 		delta_x: f64,
 		delta_y: f64,
+		resize: Key,
+		resize_opposite_corner: Key,
 	},
 	PointerMove {
 		equidistant: Key,
@@ -3050,18 +3052,112 @@ impl Fsm for PathToolFsmState {
 				responses.add(OverlaysMessage::Draw);
 				PathToolFsmState::Ready
 			}
-			(_, PathToolMessage::NudgeSelectedPoints { delta_x, delta_y }) => {
-				shape_editor.move_selected_points_and_segments(
-					tool_data.opposing_handle_lengths.take(),
-					document,
-					(delta_x, delta_y).into(),
-					true,
-					false,
-					false,
-					tool_data.opposite_handle_position,
-					false,
-					responses,
-				);
+			(
+				_,
+				PathToolMessage::NudgeSelectedPoints {
+					delta_x,
+					delta_y,
+					resize,
+					resize_opposite_corner,
+				},
+			) => {
+				let resize = input.keyboard.key(resize);
+				let resize_opposite_corner = input.keyboard.key(resize_opposite_corner);
+
+				if !resize {
+					shape_editor.move_selected_points_and_segments(
+						tool_data.opposing_handle_lengths.take(),
+						document,
+						(delta_x, delta_y).into(),
+						true,
+						false,
+						false,
+						tool_data.opposite_handle_position,
+						false,
+						responses,
+					);
+				} else {
+					// Calculate bounding box of selected points
+					let mut bounds_min = DVec2::splat(f64::MAX);
+					let mut bounds_max = DVec2::splat(f64::MIN);
+					let mut has_selection = false;
+
+					for (&layer, state) in &shape_editor.selected_shape_state {
+						let Some(vector) = document.network_interface.compute_modified_vector(layer) else { continue };
+						let transform = document.metadata().transform_to_viewport_if_feeds(layer, &document.network_interface);
+
+						for point in state.selected_points() {
+							if let Some(pos) = point.get_position(&vector) {
+								let pos = transform.transform_point2(pos);
+								bounds_min = bounds_min.min(pos);
+								bounds_max = bounds_max.max(pos);
+								has_selection = true;
+							}
+						}
+					}
+
+					if !has_selection {
+						return PathToolFsmState::Ready;
+					}
+
+					// Swap and negate coordinates as needed to match the resize direction that's closest to the current tilt angle
+					let tilt = (document.document_ptz.tilt() + std::f64::consts::TAU) % std::f64::consts::TAU;
+					let (delta_x, delta_y, opposite_x, opposite_y) = match ((tilt + std::f64::consts::FRAC_PI_4) / std::f64::consts::FRAC_PI_2).floor() as i32 % 4 {
+						0 => (delta_x, delta_y, false, false),
+						1 => (delta_y, -delta_x, false, true),
+						2 => (-delta_x, -delta_y, true, true),
+						3 => (-delta_y, delta_x, true, false),
+						_ => unreachable!(),
+					};
+
+					let size = bounds_max - bounds_min;
+					let enlargement = DVec2::new(
+						if resize_opposite_corner != opposite_x { -delta_x } else { delta_x },
+						if resize_opposite_corner != opposite_y { -delta_y } else { delta_y },
+					);
+
+					// Avoid division by zero if size is 0 (single point)
+					let enlargement_factor = if size.cmpgt(DVec2::EPSILON).all() {
+						(enlargement + size) / size
+					} else {
+						DVec2::ONE
+					};
+
+					let position = DVec2::new(
+						bounds_min.x + if resize_opposite_corner != opposite_x { delta_x } else { 0. },
+						bounds_min.y + if resize_opposite_corner != opposite_y { delta_y } else { 0. },
+					);
+					let mut pivot = (bounds_min * enlargement_factor - position) / (enlargement_factor - DVec2::ONE);
+					if !pivot.x.is_finite() {
+						pivot.x = 0.;
+					}
+					if !pivot.y.is_finite() {
+						pivot.y = 0.;
+					}
+
+					let scale = DAffine2::from_scale(enlargement_factor);
+					let pivot_transform = DAffine2::from_translation(pivot);
+					let transformation = pivot_transform * scale * pivot_transform.inverse();
+
+					responses.add(DocumentMessage::StartTransaction);
+
+					for (&layer, state) in &shape_editor.selected_shape_state {
+						let Some(vector) = document.network_interface.compute_modified_vector(layer) else { continue };
+						let transform_to_viewport = document.metadata().transform_to_viewport_if_feeds(layer, &document.network_interface);
+
+						for point in state.selected_points() {
+							if let Some(old_pos_local) = point.get_position(&vector) {
+								let old_pos_viewport = transform_to_viewport.transform_point2(old_pos_local);
+								let new_pos_viewport = transformation.transform_point2(old_pos_viewport);
+
+								let new_pos_document = document.metadata().document_to_viewport.inverse().transform_point2(new_pos_viewport);
+								shape_editor.reposition_control_point(&point, &document.network_interface, new_pos_document, layer, responses);
+							}
+						}
+					}
+
+					responses.add(DocumentMessage::EndTransaction);
+				}
 
 				PathToolFsmState::Ready
 			}
